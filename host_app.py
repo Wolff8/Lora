@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Železniški Telemetrijski API Host App (FastAPI + TCP MQTT + MÁV EMMA)
-Zagon: uvicorn host_app:app --host 0.0.0.0 --port 8000
+RailFreight SI - Celotni zajem brez filtrov z geofencingom 100 m ob progi 41
+FastAPI + TCP MQTT (1883) + MÁV EMMA + Univerzalni SSE pretočni strežnik
 """
 
 import asyncio
 import json
 import math
+import re
 import time
 import threading
 from collections import deque
@@ -14,19 +15,17 @@ from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
 from pydantic import BaseModel
 import paho.mqtt.client as mqtt
 import urllib.request
 
-# --- INICIALIZACIJA FASTAPI APLIKACIJE ---
 app = FastAPI(
-    title="RailFreight SI - Telemetry API Host",
-    description="REST in pretočni API za spremljanje železniškega koridorja Proga 41 (Lipovci - Hodoš) in mejnih tokov.",
-    version="1.0.0"
+    title="RailFreight SI - 100m Corridor Sniffer",
+    description="Zajem vseh surovih radijskih paketov z alarmom ob tirih proge 41 (toleranca 100 m).",
+    version="2.0.0"
 )
 
-# Omogočimo CORS za vse odjemalce
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,7 +34,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- GEODETSKA MREŽA PROGE 41 ---
+# --- GEODETSKA MREŽA PROGE 41 (OS TIRA) ---
 LINE_41_WAYPOINTS = [
     {"name": "Postaja Lipovci (izogibališče)", "km": 19.21, "lat": 46.62934, "lon": 16.19792},
     {"name": "Nivojski prehod Lipovci-Bratonci", "km": 20.45, "lat": 46.63581, "lon": 16.19245},
@@ -52,18 +51,19 @@ LINE_41_WAYPOINTS = [
     {"name": "Državna meja SI/HU (Hodoš meja)", "km": 54.10, "lat": 46.89910, "lon": 16.34580}
 ]
 
-# --- GLOBALNO STANJE IN MEDKORILNIKI ---
+# --- GLOBALNO STANJE ---
 class SystemState:
     mqtt_connected: bool = False
     mqtt_packets_received: int = 0
     start_time: float = time.time()
-    recent_rail_hits: deque = deque(maxlen=100)       # Zadnjih 100 dogodkov ob tirih
-    latest_mav_trains: List[Dict[str, Any]] = []      # Zadnji podatki MÁV
-    sse_subscribers: List[asyncio.Queue] = []         # Čakalne vrste za živi tok
+    recent_raw_packets: deque = deque(maxlen=50)      # Zadnjih 50 surovih paketov brez filtrov
+    recent_rail_hits: deque = deque(maxlen=100)       # Zadetki znotraj 100 m od tira
+    latest_mav_trains: List[Dict[str, Any]] = []
+    sse_subscribers: List[asyncio.Queue] = []
 
 state = SystemState()
 
-# --- MATEMATIČNI FILTER RAZDALJE DO TIRA ---
+# --- MATEMATIČNI FILTER 100 METROV OD TIRA ---
 def distance_point_to_segment(p_lat, p_lon, a_lat, a_lon, b_lat, b_lon):
     lat_mid = math.radians((a_lat + b_lat) / 2.0)
     cos_lat = math.cos(lat_mid)
@@ -81,7 +81,7 @@ def distance_point_to_segment(p_lat, p_lon, a_lat, a_lon, b_lat, b_lon):
     proj_x, proj_y = ax + t * dx, ay + t * dy
     return math.hypot(px - proj_x, py - proj_y), t
 
-def check_rail_proximity(lat: float, lon: float, max_dist_m: float = 120.0):
+def check_rail_corridor_100m(lat: float, lon: float):
     min_dist = float("inf")
     closest_hit = None
 
@@ -98,12 +98,52 @@ def check_rail_proximity(lat: float, lon: float, max_dist_m: float = 120.0):
                 "ref_station": wp_a["name"]
             }
 
-    if min_dist <= max_dist_m:
+    # Striktna meja: točno 100 metrov
+    if min_dist <= 100.0:
         return closest_hit
     return None
 
+# --- UNIVERZALNO ISKANJE KOORDINAT V KATEREMKOLI PAKETU ---
+def find_coordinates(data_obj, raw_text=""):
+    lat, lon = None, None
+
+    def search_dict(d):
+        nonlocal lat, lon
+        if not isinstance(d, dict):
+            return
+        for k, v in d.items():
+            k_lower = k.lower()
+            if k_lower in ("latitude", "lat") and isinstance(v, (int, float)):
+                lat = float(v)
+            elif k_lower in ("longitude", "lon", "lng") and isinstance(v, (int, float)):
+                lon = float(v)
+            elif k_lower in ("latitude_i", "lat_i") and isinstance(v, int):
+                lat = v / 1e7
+            elif k_lower in ("longitude_i", "lon_i") and isinstance(v, int):
+                lon = v / 1e7
+            elif isinstance(v, dict):
+                search_dict(v)
+
+    if isinstance(data_obj, dict):
+        search_dict(data_obj)
+
+    # Regex rezerva, če je JSON poškodovan ali nestandarden
+    if lat is None and raw_text:
+        m_lati = re.search(r'"latitude_i"\s*:\s*(-?\d+)', raw_text)
+        m_loni = re.search(r'"longitude_i"\s*:\s*(-?\d+)', raw_text)
+        if m_lati and m_loni:
+            lat = int(m_lati.group(1)) / 1e7
+            lon = int(m_loni.group(1)) / 1e7
+        else:
+            m_lat = re.search(r'"(?:lat|latitude)"\s*:\s*(-?\d+\.\d+)', raw_text)
+            m_lon = re.search(r'"(?:lon|longitude|lng)"\s*:\s*(-?\d+\.\d+)', raw_text)
+            if m_lat and m_lon:
+                lat = float(m_lat.group(1))
+                lon = float(m_lon.group(1))
+
+    return lat, lon
+
 def publish_event(event_type: str, payload: dict):
-    """Pošlje dogodek vsem aktivnim SSE poslušalcem."""
     msg = {"event": event_type, "data": payload, "timestamp": time.time()}
     for queue in state.sse_subscribers[:]:
         try:
@@ -111,14 +151,13 @@ def publish_event(event_type: str, payload: dict):
         except Exception:
             state.sse_subscribers.remove(queue)
 
-# --- 1. TCP MQTT ZALEDNI ODJEMALEC (paho-mqtt) ---
+# --- 1. TCP MQTT KLIENT (BREZ FILTROV) ---
 def mqtt_thread_worker():
     def on_connect(client, userdata, flags, rc, properties=None):
         if rc == 0:
             state.mqtt_connected = True
-            client.subscribe("si/meshnet/slovenia/#")
-            client.subscribe("si/meshnet/#")
-            client.subscribe("msh/EU_868/#")
+            # Naročnina na VSE teme brez filtrov
+            client.subscribe("#")
         else:
             state.mqtt_connected = False
 
@@ -127,38 +166,54 @@ def mqtt_thread_worker():
 
     def on_message(client, userdata, msg):
         state.mqtt_packets_received += 1
+        raw_payload = msg.payload.decode("utf-8", errors="ignore")
+        topic = msg.topic
+        
+        parsed_json = None
         try:
-            payload_raw = msg.payload.decode("utf-8", errors="ignore")
-            data = json.loads(payload_raw)
-            p = data.get("payload", data)
-            
-            lat = p.get("latitude") or (p.get("latitude_i", 0) / 1e7)
-            lon = p.get("longitude") or (p.get("longitude_i", 0) / 1e7)
-            speed = p.get("ground_speed", 0)
-            node_id = str(data.get("from", data.get("sender", "Neznano")))
-
-            if lat != 0 and lon != 0:
-                hit = check_rail_proximity(lat, lon, max_dist_m=120.0)
-                if hit:
-                    record = {
-                        "node_id": node_id,
-                        "lat": lat,
-                        "lon": lon,
-                        "speed_kmh": round(speed * 3.6, 1) if speed < 100 else speed,
-                        "distance_to_track_m": hit["distance_m"],
-                        "rail_km": hit["est_km"],
-                        "segment": hit["segment"],
-                        "source": "TCP_MQTT_1883",
-                        "time": time.strftime("%H:%M:%S")
-                    }
-                    state.recent_rail_hits.appendleft(record)
-                    publish_event("rail_hit", record)
+            parsed_json = json.loads(raw_payload)
         except Exception:
-            pass
+            parsed_json = None
+
+        node_id = "Neznano"
+        if isinstance(parsed_json, dict):
+            node_id = str(parsed_json.get("from") or parsed_json.get("sender") or parsed_json.get("id") or "Node")
+
+        # 1. Pošlji surovi paket v živo vsem naročnikom (brez filtrov)
+        raw_entry = {
+            "id": state.mqtt_packets_received,
+            "topic": topic,
+            "node_id": node_id,
+            "payload_snippet": raw_payload[:180],
+            "time": time.strftime("%H:%M:%S")
+        }
+        state.recent_raw_packets.appendleft(raw_entry)
+        publish_event("raw_packet", raw_entry)
+
+        # 2. Poišči koordinate kjerkoli v paketu
+        lat, lon = find_coordinates(parsed_json, raw_payload)
+        
+        # 3. Edini filter: ali je znotraj 100 m od proge 41
+        if lat is not None and lon is not None and lat != 0 and lon != 0:
+            hit = check_rail_corridor_100m(lat, lon)
+            if hit:
+                record = {
+                    "node_id": node_id,
+                    "lat": lat,
+                    "lon": lon,
+                    "distance_to_track_m": hit["distance_m"],
+                    "rail_km": hit["est_km"],
+                    "segment": hit["segment"],
+                    "ref_station": hit["ref_station"],
+                    "topic": topic,
+                    "time": time.strftime("%H:%M:%S")
+                }
+                state.recent_rail_hits.appendleft(record)
+                publish_event("rail_hit", record)
 
     while True:
         try:
-            client = mqtt.Client(client_id=f"HostAppBridge_{int(time.time())}", protocol=mqtt.MQTTv311)
+            client = mqtt.Client(client_id=f"Host100m_{int(time.time())}", protocol=mqtt.MQTTv311)
             client.username_pw_set("slovenia", "meshnet-si-slovenia")
             client.on_connect = on_connect
             client.on_disconnect = on_disconnect
@@ -169,7 +224,7 @@ def mqtt_thread_worker():
             state.mqtt_connected = False
             time.sleep(5)
 
-# --- 2. MÁV EMMA GRAPHQL ZALEDNI ZAJEMALEC ---
+# --- 2. MÁV EMMA GRAPHQL NALOGA ---
 def mav_thread_worker():
     url = "https://emma.mav.hu/otp2-backend/otp/routers/default/index/graphql"
     query = """
@@ -216,102 +271,58 @@ def mav_thread_worker():
             pass
         time.sleep(15)
 
-# Zagon zalednih niti ob zagonu aplikacije
 @app.on_event("startup")
 def startup_event():
-    t1 = threading.Thread(target=mqtt_thread_worker, daemon=True)
-    t1.start()
-    t2 = threading.Thread(target=mav_thread_worker, daemon=True)
-    t2.start()
+    threading.Thread(target=mqtt_thread_worker, daemon=True).start()
+    threading.Thread(target=mav_thread_worker, daemon=True).start()
 
-# --- MODELI PODATKOV ZA API (Pydantic) ---
-class IngestTelemetryModel(BaseModel):
-    node_id: str
-    lat: float
-    lon: float
-    speed: Optional[float] = 0.0
-    battery: Optional[int] = None
-    sensor_note: Optional[str] = "Wayside LoRa"
+# --- 3. ENDPOINTI ---
 
-# --- 3. DEFINICIJA API KONČNIH TOČK (ENDPOINTS) ---
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/docs")
 
 @app.get("/api/v1/health", tags=["Sistem"])
 def get_health():
-    """Diagnostika stanja: stanje TCP MQTT, prejeti paketi in čas delovanja."""
     return {
         "status": "online",
         "uptime_seconds": round(time.time() - state.start_time, 1),
         "tcp_mqtt_connected": state.mqtt_connected,
         "mqtt_packets_received": state.mqtt_packets_received,
         "active_sse_clients": len(state.sse_subscribers),
-        "cached_rail_hits": len(state.recent_rail_hits),
+        "cached_rail_hits_100m": len(state.recent_rail_hits),
+        "recent_raw_packets_count": len(state.recent_raw_packets),
         "active_border_mav_trains": len(state.latest_mav_trains)
     }
 
-@app.get("/api/v1/rail/hits", tags=["Proga 41"])
+@app.get("/api/v1/raw/packets", tags=["Surovi podatki"])
+def get_raw_packets(limit: int = 50):
+    """Vrne zadnje surove pakete brez kakršnihkoli filtrov."""
+    return {
+        "total_received": state.mqtt_packets_received,
+        "count": min(limit, len(state.recent_raw_packets)),
+        "data": list(state.recent_raw_packets)[:limit]
+    }
+
+@app.get("/api/v1/rail/hits", tags=["Proga 41 (100 m)"])
 def get_rail_hits(limit: int = 20):
-    """Vrne zadnje zaznane pakete/vozlišča ob tirih proge 41 (privzeto zadnjih 20)."""
+    """Vrne izključno pakete, ki so bili zaznani točno v pasu 100 m od osi tira."""
     hits = list(state.recent_rail_hits)[:limit]
     return {
+        "filter": "max_distance_100m",
         "count": len(hits),
         "data": hits
     }
 
-@app.get("/api/v1/mav/border", tags=["Mejni promet"])
-def get_mav_border_trains():
-    """Vrne trenutno aktivne vlake v madžarskem mejnem koridorju (MÁV EMMA)."""
-    return {
-        "source": "MÁV EMMA GraphQL",
-        "sector": "Hodoš - Bajánsenye - Őriszentpéter",
-        "count": len(state.latest_mav_trains),
-        "trains": state.latest_mav_trains
-    }
-
-@app.post("/api/v1/telemetry/ingest", tags=["Senzorika ob progi"])
-def ingest_telemetry(payload: IngestTelemetryModel):
-    """
-    Sprejemni endpoint za obtirne senzorje (ESP32, LoRa prehod ali ročni vnos).
-    Samodejno preveri odmik od proge 41 in ob zadetku sproži alarm v sistemu.
-    """
-    hit = check_rail_proximity(payload.lat, payload.lon, max_dist_m=150.0)
-    result = {
-        "node_id": payload.node_id,
-        "lat": payload.lat,
-        "lon": payload.lon,
-        "is_on_track": hit is not None,
-        "proximity": hit
-    }
-    
-    if hit:
-        record = {
-            "node_id": payload.node_id,
-            "lat": payload.lat,
-            "lon": payload.lon,
-            "speed_kmh": payload.speed,
-            "distance_to_track_m": hit["distance_m"],
-            "rail_km": hit["est_km"],
-            "segment": hit["segment"],
-            "source": f"HTTP_INGEST ({payload.sensor_note})",
-            "time": time.strftime("%H:%M:%S")
-        }
-        state.recent_rail_hits.appendleft(record)
-        publish_event("rail_hit", record)
-        
-    return JSONResponse(status_code=status.HTTP_201_CREATED, content=result)
-
 @app.get("/api/v1/rail/stream", tags=["Pretok v živo"])
-async def stream_rail_telemetry(request: Request):
-    """
-    Živi pretočni kanal (Server-Sent Events - SSE).
-    Vsak odjemalec (brskalnik, dashboard) prejme dogodek takoj, ko se zgodi.
-    """
+async def stream_telemetry(request: Request):
+    """SSE tok vseh surovih paketov in alarmov 100m koridorja."""
     queue = asyncio.Queue()
     state.sse_subscribers.append(queue)
 
     async def event_generator():
         try:
-            # Pošlji začetni pozdrav
-            yield f"event: connected\ndata: {json.dumps({'message': 'Povezan na RailFreight API SSE'})}\n\n"
+            yield f"event: connected\ndata: {json.dumps({'status': 'Povezan na 100m progovni tok'})}\n\n"
             while True:
                 if await request.is_disconnected():
                     break
@@ -333,6 +344,4 @@ async def stream_rail_telemetry(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    print("ZAGANJAM TELEMETRIJSKI FASTAPI HOST APP NA http://0.0.0.0:8000")
-    print("Interaktivna Swagger dokumentacija: http://localhost:8000/docs")
     uvicorn.run("host_app:app", host="0.0.0.0", port=8000, reload=False)
